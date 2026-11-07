@@ -1,0 +1,128 @@
+name: SEO structured data, sitemap and canonical checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  seo:
+    name: JSON-LD, sitemap and canonical validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Static gates — fail fast before spending time on a build.
+      - name: Every route ships OG/Twitter metadata
+        run: bun run check:route-seo
+
+      - name: Sitemap up to date
+        run: bun run check:sitemap
+
+      - name: robots.txt validation
+        run: bun run check:robots
+
+      - name: Asset OG cards match token metadata
+        run: bun run check:asset-og
+
+
+
+      - name: schema.org vocabulary snapshot up to date
+        run: bun run check:schema-vocab
+        continue-on-error: true
+
+      - name: JSON-LD + sitemap/canonical suite
+        run: bun run test:seo
+
+      # Production build + rendered-output JSON-LD validation. Catches
+      # malformed nodes that only appear in the built SSR output.
+      - name: Production build
+        run: bun run build
+
+      - name: Start SSR server
+        run: |
+          bun run dev --port 8080 > /tmp/ssr.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf -o /dev/null http://localhost:8080/ && break; sleep 2; done
+
+      # Renders every public route through real SSR and asserts each
+      # ld+json block parses, is structurally valid, and meets Google's
+      # rich-result eligibility signals for its @type.
+      - name: Rich-result eligibility (SSR routes)
+        run: bun run test:seo:jsonld
+
+      # Journal Article JSON-LD must agree with the rendered HTML title,
+      # meta description and canonical link.
+      - name: Journal Article JSON-LD / HTML parity
+        run: bun run test:seo:journal-parity
+
+      # datePublished/dateModified must be valid ISO 8601, consistent with the
+      # authored post data, the article:* meta tags and the /blog index node.
+      - name: Journal Article JSON-LD dates
+        run: bun run test:seo:journal-dates
+
+      # twitter:card / twitter:image / og:image must match the Article
+      # JSON-LD image on every journal route, including the /blog index.
+      - name: Journal Twitter card / JSON-LD image parity
+        run: bun run test:seo:journal-images
+
+      # Single-language site: every annotated page must self-reference an
+      # `en` + `x-default` alternate that matches its canonical exactly.
+      - name: hreflang self-reference parity
+        run: bun run test:seo:hreflang
+
+      - name: Journal pagination (rel prev/next + JSON-LD chain)
+        run: bun run test:seo:pagination
+
+
+
+
+
+      # Google-style rich-results gate: fails with the route, JSON path,
+      # offending property and a concrete fix hint when parsing or an
+      # eligibility signal fails.
+      - name: Rich-results parse + eligibility gate
+        run: bun run check:rich-results -- --server http://localhost:8080 --out test-artifacts/rich-results.json
+
+      # Fetches every og:image / twitter:image URL declared by the asset and
+      # token detail pages and fails on non-200 responses or any redirect
+      # other than a same-origin http -> https upgrade.
+      - name: OG/Twitter image reachability (asset pages)
+        run: bun run check:og-images -- --server http://localhost:8080 --out test-artifacts/og-images.json
+
+      - name: Validate rendered JSON-LD in build output
+        run: bun run check:jsonld
+
+      # Strict schema.org vocabulary gate: every @type must be a real
+      # schema.org type and every property must exist and be valid on its
+      # type. Warnings fail the build (no --no-strict).
+      - name: schema.org vocabulary validation (strict)
+        run: bun run check:schema-org --server http://localhost:8080
+
+      - name: Upload structured-data report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsonld-reports
+          path: test-artifacts/
+          if-no-files-found: ignore
+
+
+      # Post-build indexing push: submits only URLs whose sitemap <lastmod>
+      # changed. Dry run on pull requests; real submission on main.
+      - name: Indexing ping (dry run)
+        if: github.event_name == 'pull_request'
+        run: bun run ping:indexing:dry
+
+      - name: Ping Google + Bing indexing APIs
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          INDEXNOW_KEY: ${{ secrets.INDEXNOW_KEY }}
+          GOOGLE_INDEXING_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_INDEXING_SERVICE_ACCOUNT_JSON }}
+        run: bun run ping:indexing
